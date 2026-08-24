@@ -317,14 +317,29 @@ class SipTester:
         print(f"  From/Caller-ID: {self.caller_id}")
         media_note = " (= signalling IP)" if self.media_ip == self.local_ip else ""
         print(f"  Media (SDP)   : {self.media_ip}:{self.media_port}{media_note}")
-        if is_private_ip(self.media_ip):
-            print(warn(f"  ⚠ SDP media IP {self.media_ip} is PRIVATE — set MEDIA_IP to your public/media IP"))
-        if self.local_ip_is_auto and is_private_ip(self.local_ip):
-            print()
-            print(warn(f"  ⚠ NAT DETECTED: advertising a PRIVATE IP ({self.local_ip}) in Via/Contact/SDP."))
-            print(warn("    If the provider whitelisted your PUBLIC IP, calls will likely fail with"))
-            print(warn("    a 500/488 or connect with no audio. Set LOCAL_IP=<public IP> in config.env."))
+        self._addressing_assessment(indent="  ")
         print()
+
+    def _addressing_assessment(self, indent=""):
+        """Judge whether advertising private IPs is a problem, based on the trunk's IP class."""
+        trunk_private = is_private_ip(self.server_ip)
+        local_priv = is_private_ip(self.local_ip)
+        media_priv = is_private_ip(self.media_ip)
+        if not (local_priv or media_priv):
+            return  # both public, nothing to flag
+        if trunk_private:
+            # On-net / private-circuit trunk: private addressing is expected & correct.
+            print(dim(f"{indent}ℹ Trunk IP {self.server_ip} is also private → this looks like a private"))
+            print(dim(f"{indent}  circuit (MPLS/VPN/on-net). Advertising private IPs is EXPECTED here;"))
+            print(dim(f"{indent}  no NAT rewrite needed. (If it's actually over the internet, this is wrong.)"))
+            return
+        # Trunk is public but we're advertising private IPs → real NAT problem.
+        if local_priv:
+            print(warn(f"{indent}⚠ NAT: signalling advertises PRIVATE {self.local_ip} but trunk {self.server_ip} is PUBLIC."))
+            print(warn(f"{indent}  Set LOCAL_IP=<public IP> in config.env."))
+        if media_priv:
+            print(warn(f"{indent}⚠ NAT: SDP media advertises PRIVATE {self.media_ip} → audio will fail."))
+            print(warn(f"{indent}  Set MEDIA_IP=<public media IP> in config.env."))
 
     def do_options(self):
         self.print_target()
@@ -388,13 +403,12 @@ class SipTester:
         print()
         print(bold("── Routing / source IP ──"))
         print(f"  OS will send from : {ok(self.local_ip)}")
-        if self.local_ip_is_auto and is_private_ip(self.local_ip):
-            print(bad(f"  ⚠ This is a PRIVATE IP — the server is behind NAT."))
-            print(dim("    The provider cannot have whitelisted this address. They whitelisted your"))
-            print(dim("    PUBLIC IP. Set LOCAL_IP=<public IP> in config.env so SIP/SDP advertise it,"))
-            print(dim("    otherwise INVITEs advertise an unroutable media address and fail (e.g. 500)."))
-        else:
-            print(dim(f"  → The provider whitelist entry must equal this exact IP."))
+        print(f"  Trunk IP          : {self.server_ip} "
+              + dim("(private → on-net/private circuit)" if is_private_ip(self.server_ip)
+                    else "(public → trunk is over the internet)"))
+        self._addressing_assessment(indent="  ")
+        if not is_private_ip(self.local_ip) and not is_private_ip(self.media_ip):
+            print(dim(f"  → The provider whitelist entry must equal the send-from IP exactly."))
         print()
         print(bold("── UDP reachability (OPTIONS probe) ──"))
         return self.do_options()
