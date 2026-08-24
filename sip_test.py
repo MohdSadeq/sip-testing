@@ -122,6 +122,12 @@ class SipTester:
         self.local_ip_is_auto = li in ("", "AUTO")
         self.local_ip = detect_local_ip(self.server_ip, self.port) if self.local_ip_is_auto else li
 
+        # Media (RTP) address advertised in SDP. Trunks often separate signalling
+        # and media; if you have a distinct media IP, set MEDIA_IP. AUTO = reuse LOCAL_IP.
+        mi = cfg.get("MEDIA_IP", "AUTO").strip()
+        self.media_ip = self.local_ip if mi in ("", "AUTO") else mi
+        self.media_port = int(cfg.get("MEDIA_PORT", "40000"))
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -253,11 +259,11 @@ class SipTester:
         req_uri = f"sip:{self.dial_target}@{self.host}"
         sdp = "\r\n".join([
             "v=0",
-            f"o=- {random.randint(1,2**31)} {random.randint(1,2**31)} IN IP4 {self.local_ip}",
+            f"o=- {random.randint(1,2**31)} {random.randint(1,2**31)} IN IP4 {self.media_ip}",
             "s=sip-test",
-            f"c=IN IP4 {self.local_ip}",
+            f"c=IN IP4 {self.media_ip}",
             "t=0 0",
-            "m=audio 40000 RTP/AVP 0 8 101",
+            f"m=audio {self.media_port} RTP/AVP 0 8 101",
             "a=rtpmap:0 PCMU/8000",
             "a=rtpmap:8 PCMA/8000",
             "a=rtpmap:101 telephone-event/8000",
@@ -309,6 +315,10 @@ class SipTester:
         print(f"  Source IP     : {self.local_ip}:{self.local_port}  "
               + dim("(this is what the provider must have whitelisted)"))
         print(f"  From/Caller-ID: {self.caller_id}")
+        media_note = " (= signalling IP)" if self.media_ip == self.local_ip else ""
+        print(f"  Media (SDP)   : {self.media_ip}:{self.media_port}{media_note}")
+        if is_private_ip(self.media_ip):
+            print(warn(f"  ⚠ SDP media IP {self.media_ip} is PRIVATE — set MEDIA_IP to your public/media IP"))
         if self.local_ip_is_auto and is_private_ip(self.local_ip):
             print()
             print(warn(f"  ⚠ NAT DETECTED: advertising a PRIVATE IP ({self.local_ip}) in Via/Contact/SDP."))
@@ -521,9 +531,9 @@ class SipTester:
         extra = []
         if with_sdp:
             body = "\r\n".join([
-                "v=0", f"o=- 1 1 IN IP4 {self.local_ip}", "s=sip-test",
-                f"c=IN IP4 {self.local_ip}", "t=0 0",
-                "m=audio 40000 RTP/AVP 0", "a=rtpmap:0 PCMU/8000", "a=sendrecv", "",
+                "v=0", f"o=- 1 1 IN IP4 {self.media_ip}", "s=sip-test",
+                f"c=IN IP4 {self.media_ip}", "t=0 0",
+                f"m=audio {self.media_port} RTP/AVP 0", "a=rtpmap:0 PCMU/8000", "a=sendrecv", "",
             ])
             extra = ["Content-Type: application/sdp"]
         lines = [
