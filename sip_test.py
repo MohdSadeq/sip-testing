@@ -220,6 +220,22 @@ class SipTester:
             print(dim("     (re-run with -v to see the full raw SIP response)"))
 
     @staticmethod
+    def uri_user(value):
+        """Extract the user part (number) from a SIP URI or header value.
+        'INVITE sip:0386009400@host;user=phone ...' -> '0386009400'
+        '<sip:+61...@host>;tag=x' -> '+61...'  ; 'tel:+61...' -> '+61...' """
+        if not value:
+            return None
+        import re
+        m = re.search(r'(?:sip|sips|tel):(?:\+?)([^@;>\s]+)', value)
+        if not m:
+            return None
+        # preserve leading + if present
+        raw = m.group(0)
+        after = raw.split(":", 1)[1]
+        return after.split("@", 1)[0].split(";", 1)[0].strip()
+
+    @staticmethod
     def header(msg, name):
         name_l = name.lower()
         for line in msg.split("\r\n"):
@@ -550,9 +566,13 @@ class SipTester:
         print(dim(f"  Listening on {self.local_ip}:{self.local_port}/udp"))
         print(dim("  NOTE: the provider must be configured to deliver your DID to"))
         print(dim(f"        {self.local_ip}:{self.local_port}. Ctrl-C to stop.\n"))
-        print(f"  Now place a call to your DID number...")
+        print(f"  Now place a call to your DID number(s)...  (Ctrl-C when done)")
+        dids = {}  # did -> count, to discover multiple numbers across calls
         while True:
-            msg, addr = self.recv(timeout=3600)
+            try:
+                msg, addr = self.recv(timeout=3600)
+            except KeyboardInterrupt:
+                break
             if msg is None:
                 continue
             first = msg.split("\r\n", 1)[0]
@@ -562,19 +582,35 @@ class SipTester:
                 print(dim(f"  ← OPTIONS keepalive from {addr[0]} (answered 200)"))
                 continue
             if first.startswith("INVITE"):
-                print(ok(f"  ✓ Inbound INVITE received from {addr[0]}:{addr[1]}"))
-                fu = self.header(msg, "From")
+                print(ok(f"\n  ✓ Inbound INVITE received from {addr[0]}:{addr[1]}"))
                 to = self.header(msg, "To")
-                print(f"    From: {fu}")
-                print(f"    To  : {to}")
-                # 180 then 200 then wait for ACK, hold, BYE
+                fu = self.header(msg, "From")
+                # The DID = the called number. Prefer the Request-URI, fall back to To.
+                did = self.uri_user(first) or self.uri_user(to)
+                caller = self.uri_user(fu)
+                if did:
+                    dids[did] = dids.get(did, 0) + 1
+                    print(bold(ok(f"    DID (called number): {did}")))
+                print(f"    Caller (From)      : {caller or fu}")
+                print(dim(f"    Request-URI: {first}"))
+                print(dim(f"    To        : {to}"))
+                # answer so the provider sees the call succeed
                 self._reply(msg, addr, 100, "Trying")
                 self._reply(msg, addr, 180, "Ringing")
                 self._reply(msg, addr, 200, "OK", with_sdp=True)
                 print(ok("    Answered (200 OK). ✓ Trunk delivers inbound calls to this host."))
-                # wait briefly for ACK
-                self.recv(timeout=3)
-                return 0
+                self.recv(timeout=3)  # absorb ACK
+                print(dim("    (still listening — call another DID, or Ctrl-C to finish)"))
+        if dids:
+            print(bold("\n── DIDs seen on this trunk ──"))
+            for d, n in sorted(dids.items()):
+                print(ok(f"  {d}") + dim(f"   ({n} call{'s' if n > 1 else ''})"))
+            print(dim("  Note: this lists only DIDs that were actually dialed while listening."))
+            print(dim("  SIP can't enumerate your full DID inventory — get that from the provider portal/API."))
+        else:
+            print(warn("\nNo inbound INVITE received. The provider must route your DID to"))
+            print(warn(f"  {self.local_ip}:{self.local_port}, and a call must be placed to it."))
+        return 0
 
     def _via_from(self, msg):
         return self.header(msg, "Via")
