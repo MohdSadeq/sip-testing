@@ -104,6 +104,11 @@ class SipTester:
         self.dial_target = cfg.get("DIAL_TARGET", "").strip()
         self.auth_user = cfg.get("AUTH_USER", "").strip()
         self.auth_pass = cfg.get("AUTH_PASS", "").strip()
+        # P-Asserted-Identity value (number or full sip URI). Many trunks require it.
+        self.pai = cfg.get("PAI", "").strip()
+        self.privacy = cfg.get("PRIVACY", "").strip()  # e.g. "none" or "id"
+        # Arbitrary extra INVITE headers: "Name: Value | Name2: Value2"
+        self.extra_headers = [h.strip() for h in cfg.get("EXTRA_HEADERS", "").split("|") if h.strip()]
         self.timeout = float(cfg.get("TIMEOUT", "5"))
         self.hold = float(cfg.get("CALL_HOLD_SECONDS", "3"))
         self.local_port = int(cfg.get("LOCAL_PORT", "5062"))
@@ -271,6 +276,13 @@ class SipTester:
             "",
         ])
         lines = [f"INVITE {req_uri} SIP/2.0"] + self._common_headers("INVITE", cseq, branch, extra_auth)
+        if self.pai:
+            pai = self.pai if self.pai.lstrip().startswith(("sip:", "<", "tel:")) else f"<sip:{self.pai}@{self.host}>"
+            lines.append(f"P-Asserted-Identity: {pai}")
+        if self.privacy:
+            lines.append(f"Privacy: {self.privacy}")
+        for h in self.extra_headers:
+            lines.append(h)
         lines += [
             "Content-Type: application/sdp",
             f"Content-Length: {len(sdp.encode())}",
