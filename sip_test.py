@@ -75,6 +75,25 @@ def is_private_ip(ip):
     return False
 
 
+def tcp_probe(ip, port, timeout=3.0):
+    """L3/L4 reachability check independent of SIP.
+    Returns: 'open' (TCP listening), 'refused' (host up, port closed),
+    'filtered' (no answer — blocked/unreachable), or 'error:<msg>'."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return "open"
+    except ConnectionRefusedError:
+        return "refused"
+    except socket.timeout:
+        return "filtered"
+    except OSError as e:
+        return f"error:{e}"
+    finally:
+        s.close()
+
+
 def detect_local_ip(dest_host, dest_port):
     """Find the source IP the OS would use to reach the trunk."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -421,6 +440,21 @@ class SipTester:
         self._addressing_assessment(indent="  ")
         if not is_private_ip(self.local_ip) and not is_private_ip(self.media_ip):
             print(dim(f"  → The provider whitelist entry must equal the send-from IP exactly."))
+        print()
+        print(bold("── L3/L4 reachability (TCP probe, independent of SIP) ──"))
+        tp = tcp_probe(self.server_ip, self.port, timeout=min(self.timeout, 3.0))
+        if tp == "open":
+            print(ok(f"✓ TCP {self.server_ip}:{self.port} open — host up, SIP/TCP listening."))
+        elif tp == "refused":
+            print(ok(f"✓ Host {self.server_ip} is UP (TCP {self.port} refused)."))
+            print(dim("  L3 path is fine. So a UDP OPTIONS timeout below most likely means your"))
+            print(dim("  source IP is NOT whitelisted (the SBC silently drops unauthorized UDP)."))
+        elif tp == "filtered":
+            print(warn(f"⚠ TCP {self.server_ip}:{self.port} filtered (no answer)."))
+            print(dim("  A firewall in the path is likely dropping traffic, OR the host/port is"))
+            print(dim("  wrong. (Some SBCs firewall TCP but still answer UDP if whitelisted.)"))
+        else:
+            print(warn(f"⚠ TCP probe: {tp}"))
         print()
         print(bold("── UDP reachability (OPTIONS probe) ──"))
         return self.do_options()
