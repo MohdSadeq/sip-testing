@@ -53,6 +53,28 @@ def load_config(path):
     return cfg
 
 
+def is_private_ip(ip):
+    """True if ip is an RFC1918 / loopback / link-local IPv4 address."""
+    try:
+        octets = [int(x) for x in ip.split(".")]
+    except ValueError:
+        return False
+    if len(octets) != 4:
+        return False
+    a, b = octets[0], octets[1]
+    if a == 10:
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    if a == 192 and b == 168:
+        return True
+    if a == 127:
+        return True
+    if a == 169 and b == 254:
+        return True
+    return False
+
+
 def detect_local_ip(dest_host, dest_port):
     """Find the source IP the OS would use to reach the trunk."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -97,7 +119,8 @@ class SipTester:
         self.server_ip = addrs[0]
 
         li = cfg.get("LOCAL_IP", "AUTO").strip()
-        self.local_ip = detect_local_ip(self.server_ip, self.port) if li in ("", "AUTO") else li
+        self.local_ip_is_auto = li in ("", "AUTO")
+        self.local_ip = detect_local_ip(self.server_ip, self.port) if self.local_ip_is_auto else li
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -286,6 +309,11 @@ class SipTester:
         print(f"  Source IP     : {self.local_ip}:{self.local_port}  "
               + dim("(this is what the provider must have whitelisted)"))
         print(f"  From/Caller-ID: {self.caller_id}")
+        if self.local_ip_is_auto and is_private_ip(self.local_ip):
+            print()
+            print(warn(f"  ⚠ NAT DETECTED: advertising a PRIVATE IP ({self.local_ip}) in Via/Contact/SDP."))
+            print(warn("    If the provider whitelisted your PUBLIC IP, calls will likely fail with"))
+            print(warn("    a 500/488 or connect with no audio. Set LOCAL_IP=<public IP> in config.env."))
         print()
 
     def do_options(self):
@@ -350,7 +378,13 @@ class SipTester:
         print()
         print(bold("── Routing / source IP ──"))
         print(f"  OS will send from : {ok(self.local_ip)}")
-        print(dim(f"  → The provider whitelist entry must equal this exact IP."))
+        if self.local_ip_is_auto and is_private_ip(self.local_ip):
+            print(bad(f"  ⚠ This is a PRIVATE IP — the server is behind NAT."))
+            print(dim("    The provider cannot have whitelisted this address. They whitelisted your"))
+            print(dim("    PUBLIC IP. Set LOCAL_IP=<public IP> in config.env so SIP/SDP advertise it,"))
+            print(dim("    otherwise INVITEs advertise an unroutable media address and fail (e.g. 500)."))
+        else:
+            print(dim(f"  → The provider whitelist entry must equal this exact IP."))
         print()
         print(bold("── UDP reachability (OPTIONS probe) ──"))
         return self.do_options()
