@@ -155,6 +155,17 @@ class SipTester:
                 return None
         return None
 
+    def _print_diag_headers(self, msg):
+        """Surface headers that carry the real rejection reason (RFC 3261 Warning, etc.)."""
+        if not msg:
+            return
+        for name in ("Warning", "Reason", "P-Asserted-Identity", "Retry-After", "Error-Info"):
+            val = self.header(msg, name)
+            if val:
+                print(dim(f"     {name}: {val}"))
+        if not self.verbose:
+            print(dim("     (re-run with -v to see the full raw SIP response)"))
+
     @staticmethod
     def header(msg, name):
         name_l = name.lower()
@@ -415,8 +426,16 @@ class SipTester:
                     print(bad(f"  ✗ 404 {reason} — number not found / bad format for this trunk."))
                 elif st == 407 or st == 401:
                     print(warn(f"  ⚠ {st} {reason} — needs credentials."))
+                elif st == 500:
+                    print(bad(f"  ✗ 500 {reason} — signalling reached the trunk; its switch errored on THIS call."))
+                    print("     IP whitelist is fine. Most common causes, in order:")
+                    print("       1. Caller-ID (From) is not a number provisioned on your account")
+                    print("       2. DIAL_TARGET is in a format the trunk won't route (try +E.164 / national / 00-prefix)")
+                    print("       3. Behind NAT: SDP/Contact advertise a private IP — set LOCAL_IP to the public IP")
+                    print("       4. Missing header the trunk requires (e.g. P-Asserted-Identity)")
                 else:
                     print(bad(f"  ✗ {st} {reason} — call rejected (but signalling reached the trunk)."))
+                self._print_diag_headers(msg)
                 return 1
         print(warn("⚠ Call-setup window elapsed."))
         return 1
