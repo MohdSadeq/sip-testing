@@ -48,6 +48,29 @@ python3 sip_test.py listen
 Add `-v` / `--verbose` to any command to print the raw SIP messages.
 Use `--config /path/to/other.env` to point at a different config.
 
+### Capturing the SIP flow (built-in trace)
+
+No `sngrep`/`tcpdump` needed — `--trace` records every SIP message (timestamped,
+both directions) to a file and prints a colour-coded call-ladder at the end:
+
+```bash
+python3 sip_test.py call --trace              # writes ./sip-trace.log
+python3 sip_test.py call --trace /tmp/my.log  # custom path
+```
+
+The ladder shows the transaction at a glance (2xx green, 4xx/5xx/6xx red):
+
+```
+── SIP flow ──
+  15:29:51  →  INVITE sip:0123744142@... SIP/2.0
+  15:29:51  ←  SIP/2.0 100 Trying
+  15:29:51  ←  SIP/2.0 500 Internal Server Error
+```
+
+The file holds the complete headers/SDP for every message — share it here or
+with the provider (it includes the Call-ID they need to find the call in their
+logs). Trace works with any subcommand, including `listen`.
+
 `run.sh` is a convenience wrapper: `./run.sh diagnose`, `./run.sh options`, etc.
 
 ## Reading the results

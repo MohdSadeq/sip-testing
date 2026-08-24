@@ -113,7 +113,7 @@ def resolve(host):
 
 
 class SipTester:
-    def __init__(self, cfg, verbose=False):
+    def __init__(self, cfg, verbose=False, trace_path=None):
         self.cfg = cfg
         self.verbose = verbose
         self.host = cfg.get("SIP_HOST", "").strip()
@@ -162,23 +162,65 @@ class SipTester:
         self.call_id = uuid.uuid4().hex
         self.from_tag = uuid.uuid4().hex[:10]
 
+        # SIP trace: every message written to a file (if trace_path set), and a
+        # compact ladder kept in memory for an end-of-run summary.
+        self.trace_path = trace_path
+        self.trace_fh = None
+        self.flow = []  # list of (ts, direction, summary)
+        if self.trace_path:
+            try:
+                self.trace_fh = open(self.trace_path, "a", buffering=1)
+                self.trace_fh.write(
+                    f"\n===== SIP trace {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"local={self.local_ip}:{self.local_port} "
+                    f"trunk={self.server_ip}:{self.port} =====\n")
+            except OSError as e:
+                sys.exit(bad(f"Cannot open trace file {self.trace_path}: {e}"))
+
     # ── low level ───────────────────────────────────────────────
     def _branch(self):
         return "z9hG4bK" + uuid.uuid4().hex[:16]
 
-    def _log_send(self, msg):
-        if self.verbose:
-            print(dim("\n>>> SENT >>>"))
-            print(dim(msg.rstrip()))
+    @staticmethod
+    def _first_line(msg):
+        return msg.split("\r\n", 1)[0] if msg else ""
 
-    def _log_recv(self, msg):
+    def _trace(self, direction, msg, peer=None):
+        """Record one SIP message to the trace file + the in-memory ladder."""
+        ts = time.strftime("%H:%M:%S")
+        summary = self._first_line(msg)
+        self.flow.append((ts, direction, summary))
+        arrow = "-->" if direction == "SENT" else "<--"
         if self.verbose:
-            print(dim("\n<<< RECV <<<"))
+            print(dim(f"\n{arrow} {direction} {arrow}"))
             print(dim(msg.rstrip()))
+        if self.trace_fh:
+            where = f" {arrow} {peer[0]}:{peer[1]}" if peer else ""
+            self.trace_fh.write(f"\n[{ts}] {direction}{where}\n")
+            self.trace_fh.write(msg.rstrip() + "\n")
+
+    def print_flow_ladder(self):
+        if not self.flow:
+            return
+        print(bold("\n── SIP flow ──"))
+        for ts, direction, summary in self.flow:
+            arrow = "→" if direction == "SENT" else "←"
+            color = ok if direction == "RECV" and " 2" in summary[:12] else (
+                bad if direction == "RECV" and (" 4" in summary[:12] or " 5" in summary[:12] or " 6" in summary[:12]) else dim)
+            print(f"  {ts}  {arrow}  " + color(summary))
+        if self.trace_path:
+            print(dim(f"  full trace written to {self.trace_path}"))
+
+    def close_trace(self):
+        if self.trace_fh:
+            try:
+                self.trace_fh.close()
+            except OSError:
+                pass
 
     def send(self, msg):
-        self._log_send(msg)
         self.sock.sendto(msg.encode(), (self.server_ip, self.port))
+        self._trace("SENT", msg, (self.server_ip, self.port))
 
     def recv(self, timeout=None):
         timeout = self.timeout if timeout is None else timeout
@@ -192,7 +234,7 @@ class SipTester:
                 return None, None
             data, addr = self.sock.recvfrom(65535)
             text = data.decode(errors="replace")
-            self._log_recv(text)
+            self._trace("RECV", text, addr)
             return text, addr
 
     @staticmethod
@@ -641,7 +683,9 @@ class SipTester:
             f"CSeq: {cseq}",
             f"Contact: <sip:{self.from_user}@{self.local_ip}:{self.local_port}>",
         ] + extra + [f"Content-Length: {len(body.encode())}", "", body]
-        self.sock.sendto("\r\n".join(lines).encode(), addr)
+        out = "\r\n".join(lines)
+        self.sock.sendto(out.encode(), addr)
+        self._trace("SENT", out, addr)
 
     def _reply_200(self, req, addr, method):
         self._reply(req, addr, 200, "OK")
@@ -651,11 +695,20 @@ def main():
     ap = argparse.ArgumentParser(description="Pure-Python SIP trunk tester (IP-whitelist)")
     ap.add_argument("command", choices=["diagnose", "options", "call", "listen"])
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.env"))
-    ap.add_argument("--verbose", "-v", action="store_true", help="print raw SIP messages")
+    ap.add_argument("--verbose", "-v", action="store_true", help="print raw SIP messages to the console")
+    ap.add_argument("--trace", nargs="?", const="__DEFAULT__", metavar="FILE",
+                    help="write a timestamped SIP trace to FILE (default: sip-trace.log) "
+                         "and print a call-ladder summary at the end")
     args = ap.parse_args()
 
+    trace_path = None
+    if args.trace is not None:
+        trace_path = (os.path.join(os.path.dirname(os.path.abspath(__file__)), "sip-trace.log")
+                      if args.trace == "__DEFAULT__" else args.trace)
+
     cfg = load_config(args.config)
-    t = SipTester(cfg, verbose=args.verbose)
+    t = SipTester(cfg, verbose=args.verbose, trace_path=trace_path)
+    rc = 1
     try:
         if args.command == "options":
             rc = t.do_options()
@@ -665,10 +718,14 @@ def main():
             rc = t.do_call()
         elif args.command == "listen":
             rc = t.do_listen()
-        sys.exit(rc)
     except KeyboardInterrupt:
         print("\ninterrupted")
-        sys.exit(130)
+        rc = 130
+    finally:
+        if trace_path:
+            t.print_flow_ladder()
+        t.close_trace()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
