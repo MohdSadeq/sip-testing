@@ -36,8 +36,9 @@ python3 sip_test.py diagnose
 python3 sip_test.py options
 
 # 3. Outbound call: INVITE to DIAL_TARGET, follows 100/180/183/200, ACKs,
-#    holds CALL_HOLD_SECONDS, then BYE. Proves outbound call signalling.
-#    (No RTP/audio is sent — this validates signalling, not voice path.)
+#    holds CALL_HOLD_SECONDS, then BYE. While the call is up it streams G.711
+#    audio (a beep, or AUDIO_FILE) to the callee and records what comes back
+#    to a WAV — so it proves the two-way voice path, not just signalling.
 python3 sip_test.py call
 
 # 4. Inbound DID: wait for the trunk to deliver a call, auto-answer 200 then BYE.
@@ -70,6 +71,34 @@ The ladder shows the transaction at a glance (2xx green, 4xx/5xx/6xx red):
 The file holds the complete headers/SDP for every message — share it here or
 with the provider (it includes the Call-ID they need to find the call in their
 logs). Trace works with any subcommand, including `listen`.
+
+### Audio test (RTP) on the call test
+
+`call` binds `MEDIA_IP:MEDIA_PORT` (the address in its SDP) before the INVITE, reads
+the far end's media address from the 183/200 SDP, and once answered streams
+8 kHz G.711 (PCMU or PCMA, whichever the answer offers) in 20 ms packets. Every
+RTP packet that comes back is counted and decoded into a WAV:
+
+```
+── RTP audio ──
+  sent     : 750 packets (~750 expected for 15s)
+  received : 748 packets, 128656 bytes from 172.16.1.139:10042 (748)
+  codec    : PCMU
+  recorded : 15.0s of far-end audio → ./recv-20260911-071950.wav
+  ✓ Two-way media path works (RTP flowed in both directions).
+```
+
+- The callee hears a repeating **440 Hz beep** (2 s on / 0.5 s off). Set
+  `AUDIO_FILE=hello.wav` to play a real message instead (8 kHz mono 16-bit ideal).
+- **Speak into the answered phone** — the recording is what the platform/trunk
+  delivered back. Play it with `aplay recv-*.wav` (or copy it off and use VLC).
+- Give it time: `CALL_HOLD_SECONDS=15` or more. Answer the phone within the
+  30 s call-setup window.
+- `received: 0 packets` with a good signalling ladder means the media path is
+  broken: firewall on the RTP port, wrong `MEDIA_IP`, or the relay's port range
+  not open. `AUDIO=off` returns to a signalling-only call.
+- The tester uses `RTP/AVP` (plain, no SRTP). `rtp_audio.py` is stdlib-only, so
+  it works on Python 3.13+ where `audioop` was removed.
 
 `run.sh` is a convenience wrapper: `./run.sh diagnose`, `./run.sh options`, etc.
 

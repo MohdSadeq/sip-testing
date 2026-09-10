@@ -12,7 +12,9 @@ Subcommands:
               407/401 = trunk wants credentials; timeout = blocked/wrong host)
   call       Send an INVITE to DIAL_TARGET, follow the transaction
              (100/180/183/200), ACK on answer, hold, then BYE.
-             Proves outbound signalling end-to-end. (Audio/RTP not sent.)
+             While the call is up it streams G.711 audio (AUDIO_FILE or a
+             beep tone) to the far end and records what comes back to a WAV,
+             so it proves the two-way media path as well as signalling.
   listen     Bind and wait for an inbound INVITE (DID test). Auto-answers
              with 200 then BYE so you can confirm the trunk delivers calls.
 
@@ -28,6 +30,9 @@ import socket
 import sys
 import time
 import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rtp_audio
 
 # ── tiny ANSI helpers ───────────────────────────────────────────
 def _c(code, s):
@@ -151,6 +156,15 @@ class SipTester:
         mi = cfg.get("MEDIA_IP", "AUTO").strip()
         self.media_ip = self.local_ip if mi in ("", "AUTO") else mi
         self.media_port = int(cfg.get("MEDIA_PORT", "40000"))
+
+        # RTP audio for the call test (see rtp_audio.py). AUDIO=off disables it.
+        self.audio = cfg.get("AUDIO", "on").strip().lower() not in ("off", "0", "no", "false")
+        self.audio_file = cfg.get("AUDIO_FILE", "").strip()
+        self.tone_hz = float(cfg.get("TONE_HZ", "440"))
+        rec = cfg.get("RECORD_FILE", "AUTO").strip()
+        self.record_file = (os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         time.strftime("recv-%Y%m%d-%H%M%S.wav"))
+                            if rec in ("", "AUTO") else (None if rec.lower() == "off" else rec))
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -517,11 +531,87 @@ class SipTester:
         print(bold("── UDP reachability (OPTIONS probe) ──"))
         return self.do_options()
 
+    @staticmethod
+    def body(msg):
+        return msg.split("\r\n\r\n", 1)[1] if msg and "\r\n\r\n" in msg else ""
+
+    def _start_rtp(self):
+        """Bind the advertised media port so early media / answer audio can be received."""
+        if not self.audio:
+            return None
+        try:
+            if self.audio_file:
+                pcm = rtp_audio.load_wav_pcm(self.audio_file)
+                src = f"file {self.audio_file}"
+            else:
+                pcm = rtp_audio.tone_pcm(self.tone_hz)
+                src = f"{self.tone_hz:g} Hz beep (2s on / 0.5s off)"
+        except (OSError, ValueError, rtp_audio.wave.Error) as e:
+            print(warn(f"  ⚠ AUDIO_FILE unusable ({e}); sending a tone instead"))
+            pcm = rtp_audio.tone_pcm(self.tone_hz)
+            src = f"{self.tone_hz:g} Hz beep"
+        try:
+            rtp = rtp_audio.RtpSession(self.media_ip, self.media_port, pcm, self.record_file)
+        except OSError as e:
+            print(warn(f"  ⚠ cannot bind RTP port {self.media_port}: {e} — signalling-only call"))
+            return None
+        print(dim(f"  RTP: listening on {rtp.bound[0]}:{rtp.bound[1]}, will send {src}"))
+        if rtp.bound[0] != self.media_ip:
+            print(warn(f"  ⚠ MEDIA_IP {self.media_ip} is not a local address; bound 0.0.0.0 instead"))
+        return rtp
+
+    def _learn_remote_media(self, rtp, msg, label):
+        if rtp is None:
+            return
+        parsed = rtp_audio.parse_sdp_media(self.body(msg))
+        if not parsed:
+            return
+        ip, port, pt = parsed
+        if pt is None:
+            print(warn(f"  ⚠ {label} SDP offers neither PCMU nor PCMA — will send PCMU anyway"))
+        if rtp.remote != (ip, port):
+            codec = {0: "PCMU", 8: "PCMA"}.get(pt, f"pt {pt}")
+            print(dim(f"  {label} SDP: far-end media {ip}:{port} ({codec})"))
+        rtp.set_remote(ip, port, pt)
+
+    def _rtp_report(self, rtp, held):
+        """Print what the media path did and return True if two-way audio was seen."""
+        rec_secs = rtp.stop()
+        expected = int(held * 1000 / rtp_audio.PTIME_MS)
+        print(bold("\n── RTP audio ──"))
+        print(f"  sent     : {rtp.sent} packets" + dim(f" (~{expected} expected for {held:g}s)"))
+        if rtp.recv_pkts:
+            srcs = ", ".join(f"{a[0]}:{a[1]} ({n})" for a, n in sorted(rtp.recv_from.items(), key=lambda kv: -kv[1]))
+            pts = ", ".join({0: "PCMU", 8: "PCMA"}.get(p, f"pt{p}") for p in sorted(rtp.recv_pts))
+            print(ok(f"  received : {rtp.recv_pkts} packets, {rtp.recv_bytes} bytes from {srcs}"))
+            print(f"  codec    : {pts}" + (dim(f"   seq gaps: {rtp.seq_gaps}") if rtp.seq_gaps else ""))
+            if rtp.remote and rtp.remote not in rtp.recv_from:
+                print(warn(f"  ⚠ audio came from a different address than the SDP said ({rtp.remote[0]}:{rtp.remote[1]})"))
+            if rec_secs:
+                print(ok(f"  recorded : {rec_secs:.1f}s of far-end audio → {self.record_file}"))
+                print(dim("             play it back (aplay / VLC) — you should hear the far end."))
+            print(ok("  ✓ Two-way media path works (RTP flowed in both directions)."))
+            return True
+        print(bad("  received : 0 packets — nothing came back"))
+        print("     The far end (or the media relay) never sent RTP to "
+              f"{rtp.bound[0]}:{rtp.bound[1]}. Check: firewall on the media IP/port,")
+        print("     MEDIA_IP is the address the provider can actually reach, rtpengine's")
+        print("     relay IP/port range is open, and the callee's phone was really off-hook.")
+        return False
+
     def do_call(self):
         if not self.dial_target:
             sys.exit(bad("DIAL_TARGET is empty in config — set the number to dial."))
         self.print_target()
         print(bold(f"Placing test call to {self.dial_target} ...\n"))
+        rtp = self._start_rtp()
+        try:
+            return self._do_call(rtp)
+        finally:
+            if rtp is not None and rtp._thread.is_alive():
+                rtp.stop()
+
+    def _do_call(self, rtp):
         cseq = 1
         branch = self._branch()
         self.send(self.build_invite(cseq, branch))
@@ -537,6 +627,8 @@ class SipTester:
                     print("  IP not whitelisted (silent drop), firewall, or wrong host/port.")
                     return 2
                 print(warn("⚠ No further response after provisional; giving up."))
+                if rtp is not None and rtp.recv_pkts:
+                    print(dim(f"  (early media: {rtp.recv_pkts} RTP packets received while ringing)"))
                 return 1
             st = self.status(msg)
             reason = msg.split("\r\n", 1)[0].split(" ", 2)[-1]
@@ -559,23 +651,44 @@ class SipTester:
             if st == 180:
                 print(f"  {ok('180 Ringing')} — remote is ringing"); got_provisional = True; continue
             if st == 183:
-                print(f"  {ok('183 Session Progress')} — early media"); got_provisional = True; continue
+                print(f"  {ok('183 Session Progress')} — early media"); got_provisional = True
+                self._learn_remote_media(rtp, msg, "183")
+                continue
             if st and 200 <= st < 300:
                 print(ok(f"  {st} {reason} — CALL ANSWERED"))
                 answered_to = self.header(msg, "To")
                 ack_branch = self._branch()
                 self.send(self.build_ack(cseq, answered_to, ack_branch, req_uri))
-                print(dim(f"  ACK sent. Holding {self.hold:g}s (no RTP audio sent)..."))
-                if self.hold > 0:
-                    time.sleep(self.hold)
+                self._learn_remote_media(rtp, msg, "200")
+                if rtp is not None and rtp.remote:
+                    rtp.start_sending()
+                    print(dim(f"  ACK sent. Holding {self.hold:g}s, streaming audio to "
+                              f"{rtp.remote[0]}:{rtp.remote[1]} ..."))
+                elif rtp is not None:
+                    print(warn("  ACK sent. 200 OK carried no usable SDP — cannot send audio; holding "
+                               f"{self.hold:g}s listening only..."))
+                else:
+                    print(dim(f"  ACK sent. Holding {self.hold:g}s (audio disabled)..."))
+                held_from = time.monotonic()
+                # Stay responsive to in-dialog requests (e.g. far-end BYE) while holding.
+                while time.monotonic() - held_from < self.hold:
+                    m, addr = self.recv(timeout=min(0.5, self.hold - (time.monotonic() - held_from)))
+                    if m and m.startswith("BYE "):
+                        self._reply(m, addr, 200, "OK")
+                        print(warn("  far end hung up first (BYE received, answered 200)"))
+                        if rtp is not None:
+                            self._rtp_report(rtp, time.monotonic() - held_from)
+                        return 0
+                held = time.monotonic() - held_from
+                media_ok = self._rtp_report(rtp, held) if rtp is not None else None
                 cseq += 1
                 self.send(self.build_bye(cseq, answered_to, self._branch()))
                 bye_resp, _ = self.recv(timeout=self.timeout)
                 if self.status(bye_resp) == 200:
-                    print(ok("  200 OK to BYE — call torn down cleanly. ✓ Outbound signalling works."))
+                    print(ok("\n  200 OK to BYE — call torn down cleanly. ✓ Outbound signalling works."))
                 else:
-                    print(warn("  BYE sent (no/other response) — call setup itself succeeded."))
-                return 0
+                    print(warn("\n  BYE sent (no/other response) — call setup itself succeeded."))
+                return 0 if media_ok in (True, None) else 1
             if st and 300 <= st < 400:
                 print(warn(f"  {st} {reason} — redirect")); return 1
             if st and st >= 400:

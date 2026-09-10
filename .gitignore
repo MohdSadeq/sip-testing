@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 sip-trace.log
 *.trace.log
+recv-*.wav
