@@ -626,7 +626,9 @@ class SipTester:
             srcs = ", ".join(f"{a[0]}:{a[1]} ({n})" for a, n in sorted(rtp.recv_from.items(), key=lambda kv: -kv[1]))
             pts = ", ".join({0: "PCMU", 8: "PCMA"}.get(p, f"pt{p}") for p in sorted(rtp.recv_pts))
             print(ok(f"  received : {rtp.recv_pkts} packets, {rtp.recv_bytes} bytes from {srcs}"))
-            print(f"  codec    : {pts}" + (dim(f"   seq gaps: {rtp.seq_gaps}") if rtp.seq_gaps else ""))
+            extra = (f"   seq gaps: {rtp.seq_gaps}" if rtp.seq_gaps else "") + \
+                    (f"   rtcp: {rtp.rtcp_pkts}" if rtp.rtcp_pkts else "")
+            print(f"  codec    : {pts}" + dim(extra))
             if rtp.remote and rtp.remote not in rtp.recv_from:
                 print(warn(f"  ⚠ audio came from a different address than the SDP said ({rtp.remote[0]}:{rtp.remote[1]})"))
             if rec_secs:

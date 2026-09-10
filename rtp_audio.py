@@ -154,6 +154,7 @@ class RtpSession:
         self.ts = random.getrandbits(32)
         self.sent = 0
         self.recv_pkts = 0
+        self.rtcp_pkts = 0
         self.recv_bytes = 0
         self.recv_from = {}           # addr -> count
         self.recv_pts = {}            # payload type -> count
@@ -230,6 +231,9 @@ class RtpSession:
         if len(data) < 12 or (data[0] >> 6) != 2:
             return
         pt = data[1] & 0x7F
+        if 72 <= pt <= 76:                       # RTCP (SR/RR/SDES/BYE/APP) muxed on the RTP port
+            self.rtcp_pkts += 1
+            return
         seq = struct.unpack("!H", data[2:4])[0]
         cc = data[0] & 0x0F
         hdr_len = 12 + 4 * cc
