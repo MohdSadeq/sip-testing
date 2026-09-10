@@ -299,6 +299,47 @@ class SipTester:
                 return line.split(":", 1)[1].strip()
         return None
 
+    @staticmethod
+    def headers_all(msg, name):
+        """Every value of a header, with comma-separated lists split (commas inside <> kept)."""
+        name_l = name.lower()
+        out = []
+        for line in msg.split("\r\n"):
+            if not line.lower().startswith(name_l + ":"):
+                continue
+            depth, cur = 0, ""
+            for ch in line.split(":", 1)[1]:
+                if ch == "<":
+                    depth += 1
+                elif ch == ">":
+                    depth -= 1
+                if ch == "," and depth == 0:
+                    out.append(cur.strip()); cur = ""
+                else:
+                    cur += ch
+            if cur.strip():
+                out.append(cur.strip())
+        return out
+
+    @staticmethod
+    def uri_of(value):
+        """'<sip:x@y;lr>;tag=1' -> 'sip:x@y;lr' ; 'sip:x@y' -> 'sip:x@y'."""
+        if not value:
+            return None
+        if "<" in value and ">" in value:
+            return value[value.index("<") + 1:value.index(">")].strip()
+        return value.split(";", 1)[0].strip()
+
+    def _learn_dialog(self, msg):
+        """From a 2xx to our INVITE: the route set (RFC 3261 §12.1.2) and remote target.
+        Behind a proxy, ACK/BYE must carry Route headers built from Record-Route
+        (reversed) and target the far end's Contact — otherwise the proxy can't
+        route them (the 200 OK gets retransmitted, the BYE loops or 483s)."""
+        rr = self.headers_all(msg, "Record-Route")
+        self.route_set = list(reversed(rr))
+        contact = self.uri_of(self.header(msg, "Contact"))
+        self.remote_target = contact or f"sip:{self.dial_target}@{self.host}"
+
     # ── digest auth (only if trunk challenges AND creds provided) ─
     def _digest(self, msg, method, uri):
         chal = self.header(msg, "WWW-Authenticate") or self.header(msg, "Proxy-Authenticate")
@@ -382,34 +423,35 @@ class SipTester:
         ]
         return "\r\n".join(lines)
 
-    def build_ack(self, cseq, to_hdr, branch, req_uri):
+    def _in_dialog(self, method, cseq, to_hdr, branch, req_uri, in_dialog=True):
+        """ACK / BYE. In-dialog ones use the learned route set + remote target;
+        an ACK for a non-2xx final response (in_dialog=False) goes back the way
+        the INVITE went."""
+        if in_dialog and getattr(self, "remote_target", None):
+            req_uri = self.remote_target
         lines = [
-            f"ACK {req_uri} SIP/2.0",
+            f"{method} {req_uri} SIP/2.0",
             f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch};rport",
             "Max-Forwards: 70",
+        ]
+        if in_dialog:
+            for r in getattr(self, "route_set", []):
+                lines.append(f"Route: {r}")
+        lines += [
             f"From: <sip:{self.caller_id}@{self.host}>;tag={self.from_tag}",
             f"To: {to_hdr}",
             f"Call-ID: {self.call_id}",
-            f"CSeq: {cseq} ACK",
+            f"CSeq: {cseq} {method}",
             "Content-Length: 0",
             "", "",
         ]
         return "\r\n".join(lines)
 
+    def build_ack(self, cseq, to_hdr, branch, req_uri, in_dialog=True):
+        return self._in_dialog("ACK", cseq, to_hdr, branch, req_uri, in_dialog)
+
     def build_bye(self, cseq, to_hdr, branch):
-        req_uri = f"sip:{self.dial_target}@{self.host}"
-        lines = [
-            f"BYE {req_uri} SIP/2.0",
-            f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch};rport",
-            "Max-Forwards: 70",
-            f"From: <sip:{self.caller_id}@{self.host}>;tag={self.from_tag}",
-            f"To: {to_hdr}",
-            f"Call-ID: {self.call_id}",
-            f"CSeq: {cseq} BYE",
-            "Content-Length: 0",
-            "", "",
-        ]
-        return "\r\n".join(lines)
+        return self._in_dialog("BYE", cseq, to_hdr, branch, f"sip:{self.dial_target}@{self.host}")
 
     # ── high-level flows ────────────────────────────────────────
     def print_target(self):
@@ -635,7 +677,7 @@ class SipTester:
             # auth challenge on INVITE
             if st in (401, 407):
                 to_hdr = self.header(msg, "To")
-                self.send(self.build_ack(cseq, to_hdr, branch, req_uri))
+                self.send(self.build_ack(cseq, to_hdr, branch, req_uri, in_dialog=False))
                 if self.auth_user:
                     auth = self._digest(msg, "INVITE", req_uri)
                     if auth:
@@ -657,6 +699,9 @@ class SipTester:
             if st and 200 <= st < 300:
                 print(ok(f"  {st} {reason} — CALL ANSWERED"))
                 answered_to = self.header(msg, "To")
+                self._learn_dialog(msg)
+                if self.route_set:
+                    print(dim(f"  dialog: via {len(self.route_set)} Record-Route hop(s), remote target {self.remote_target}"))
                 ack_branch = self._branch()
                 self.send(self.build_ack(cseq, answered_to, ack_branch, req_uri))
                 self._learn_remote_media(rtp, msg, "200")
@@ -673,6 +718,10 @@ class SipTester:
                 # Stay responsive to in-dialog requests (e.g. far-end BYE) while holding.
                 while time.monotonic() - held_from < self.hold:
                     m, addr = self.recv(timeout=min(0.5, self.hold - (time.monotonic() - held_from)))
+                    if m and self.status(m) == 200 and (self.header(m, "CSeq") or "").endswith("INVITE"):
+                        # retransmitted 200 OK: the far end hasn't seen our ACK — resend it
+                        self.send(self.build_ack(cseq, answered_to, ack_branch, req_uri))
+                        continue
                     if m and m.startswith("BYE "):
                         self._reply(m, addr, 200, "OK")
                         print(warn("  far end hung up first (BYE received, answered 200)"))
@@ -693,7 +742,7 @@ class SipTester:
                 print(warn(f"  {st} {reason} — redirect")); return 1
             if st and st >= 400:
                 to_hdr = self.header(msg, "To")
-                self.send(self.build_ack(cseq, to_hdr, branch, req_uri))
+                self.send(self.build_ack(cseq, to_hdr, branch, req_uri, in_dialog=False))
                 if st == 403:
                     print(bad(f"  ✗ 403 {reason} — rejected. IP likely not whitelisted, or"))
                     print("     the trunk disallows this destination/caller-ID.")
