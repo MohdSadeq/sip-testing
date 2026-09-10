@@ -88,11 +88,14 @@ RTP packet that comes back is counted and decoded into a WAV:
   ✓ Two-way media path works (RTP flowed in both directions).
 ```
 
-- The callee hears a repeating **440 Hz beep** (2 s on / 0.5 s off). Set
-  `AUDIO_FILE=hello.wav` to play a real message instead (8 kHz mono 16-bit ideal).
+- The callee hears `AUDIO_FILE` — by default `test-message.wav`, a spoken
+  ~16 s announcement ("This is a test call from the voice platform…") that asks
+  them to talk back. Point it at your own WAV (8 kHz mono 16-bit ideal) or leave
+  it blank for a repeating **440 Hz beep**. Regenerate the default with
+  `espeak-ng` + `sox` (see the commit that added it).
 - **Speak into the answered phone** — the recording is what the platform/trunk
   delivered back. Play it with `aplay recv-*.wav` (or copy it off and use VLC).
-- Give it time: `CALL_HOLD_SECONDS=15` or more. Answer the phone within the
+- Give it time: `CALL_HOLD_SECONDS=20` or more (the message alone is ~16 s). Answer the phone within the
   30 s call-setup window.
 - `received: 0 packets` with a good signalling ladder means the media path is
   broken: firewall on the RTP port, wrong `MEDIA_IP`, or the relay's port range
@@ -125,8 +128,8 @@ RTP packet that comes back is counted and decoded into a WAV:
   5060 needs root (`sudo python3 sip_test.py listen`) or set `LOCAL_PORT` to
   whatever the provider is configured to send to. The default `LOCAL_PORT=5062`
   avoids needing root for the outbound tests.
-- **Voice/RTP.** The `call` test proves signalling only. To verify two-way
-  audio you need a real softphone (baresip/pjsua/linphone) that sends RTP; this
-  toolkit deliberately stays dependency-free.
+- **Voice/RTP.** The `call` test streams G.711 and records the return audio
+  (see "Audio test" above) — still dependency-free. It does not do SRTP, DTMF,
+  or codecs beyond PCMU/PCMA; for those use a real softphone (baresip/pjsua).
 - **Watch packets (optional):** `sudo apt install sngrep` then run `sngrep` in
   another terminal to see the live SIP dialog while you test.

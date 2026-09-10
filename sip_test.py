@@ -160,6 +160,11 @@ class SipTester:
         # RTP audio for the call test (see rtp_audio.py). AUDIO=off disables it.
         self.audio = cfg.get("AUDIO", "on").strip().lower() not in ("off", "0", "no", "false")
         self.audio_file = cfg.get("AUDIO_FILE", "").strip()
+        if self.audio_file and not os.path.isabs(self.audio_file) and not os.path.exists(self.audio_file):
+            # relative to the tester's own folder, so it works from any cwd
+            here = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.audio_file)
+            if os.path.exists(here):
+                self.audio_file = here
         self.tone_hz = float(cfg.get("TONE_HZ", "440"))
         rec = cfg.get("RECORD_FILE", "AUTO").strip()
         self.record_file = (os.path.join(os.path.dirname(os.path.abspath(__file__)),
