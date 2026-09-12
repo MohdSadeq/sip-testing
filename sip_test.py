@@ -15,6 +15,9 @@ Subcommands:
              While the call is up it streams G.711 audio (AUDIO_FILE or a
              beep tone) to the far end and records what comes back to a WAV,
              so it proves the two-way media path as well as signalling.
+  bridge     Dial DIAL_TARGET and the platform app sip:<BRIDGE_APP>@SIP_HOST
+             (default ai), then relay audio between them — an outbound call
+             where the person talks to the voice-AI agent. Records both sides.
   listen     Bind and wait for an inbound INVITE (DID test). Auto-answers
              with 200 then BYE so you can confirm the trunk delivers calls.
 
@@ -118,7 +121,7 @@ def resolve(host):
 
 
 class SipTester:
-    def __init__(self, cfg, verbose=False, trace_path=None):
+    def __init__(self, cfg, verbose=False, trace_path=None, rec_suffix=""):
         self.cfg = cfg
         self.verbose = verbose
         self.host = cfg.get("SIP_HOST", "").strip()
@@ -168,8 +171,11 @@ class SipTester:
         self.tone_hz = float(cfg.get("TONE_HZ", "440"))
         rec = cfg.get("RECORD_FILE", "AUTO").strip()
         self.record_file = (os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         time.strftime("recv-%Y%m%d-%H%M%S.wav"))
+                                         time.strftime(f"recv-%Y%m%d-%H%M%S{rec_suffix}.wav"))
                             if rec in ("", "AUTO") else (None if rec.lower() == "off" else rec))
+        # bridge: which platform app the phone is connected to, and for how long
+        self.bridge_app = cfg.get("BRIDGE_APP", "ai").strip() or "ai"
+        self.bridge_secs = float(cfg.get("BRIDGE_SECONDS", "120"))
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -660,12 +666,167 @@ class SipTester:
             if rtp is not None and rtp._thread.is_alive():
                 rtp.stop()
 
+    # ── bridge: phone ↔ platform app (a tiny B2BUA) ─────────────────────────
+    def do_bridge(self, app=None):
+        """Dial DIAL_TARGET (leg A) and the platform app `sip:<app>@SIP_HOST` (leg B), both via
+        the proxy, then relay RTP between them: the person on the phone talks to the app (the
+        voice-AI agent by default). Lets an outbound call exercise features that otherwise only
+        run on inbound calls."""
+        app = app or self.bridge_app
+        if not self.dial_target:
+            sys.exit(bad("DIAL_TARGET is empty in config — set the number to dial."))
+        self.print_target()
+        print(bold(f"Bridging {self.dial_target}  ↔  sip:{app}@{self.host}   (up to {self.bridge_secs:g}s)\n"))
+
+        # Leg B is a second tester on the next ports; its recording is the app's voice.
+        cfg_b = dict(self.cfg)
+        cfg_b["LOCAL_PORT"] = str(self.local_port + 2)
+        cfg_b["MEDIA_PORT"] = str(self.media_port + 2)
+        cfg_b["AUDIO_FILE"] = ""
+        legb = SipTester(cfg_b, verbose=self.verbose, trace_path=self.trace_path, rec_suffix=f"-{app}")
+        if self.record_file:
+            self.record_file = self.record_file.replace(".wav", "-phone.wav")
+
+        rtp_a = rtp_audio.RtpSession(self.media_ip, self.media_port, [], self.record_file)
+        rtp_b = rtp_audio.RtpSession(legb.media_ip, legb.media_port, [], legb.record_file)
+        rtp_a.forward_to, rtp_b.forward_to = rtp_b, rtp_a
+        print(dim(f"  RTP: leg A on {rtp_a.bound[0]}:{rtp_a.bound[1]}, leg B on {rtp_b.bound[0]}:{rtp_b.bound[1]} (relay mode)"))
+        dlg_a = dlg_b = None
+        started = time.monotonic()
+        try:
+            print(bold(f"\n[A] calling {self.dial_target} ..."))
+            dlg_a = self._setup_call(rtp_a, self.dial_target)
+            if not isinstance(dlg_a, dict):
+                print(bad("  leg A (phone) did not answer — nothing to bridge"))
+                return dlg_a
+            print(bold(f"\n[B] calling sip:{app}@{self.host} ..."))
+            dlg_b = legb._setup_call(rtp_b, app)
+            if not isinstance(dlg_b, dict):
+                print(bad(f"  leg B (sip:{app}@) failed — hanging up the phone"))
+                self._hangup(dlg_a); dlg_a = None
+                return dlg_b
+            started = time.monotonic()
+            print(ok(f"\n  ✓ bridged — talk now. The {app} app hears the phone and vice versa."))
+            print(dim(f"    ends after {self.bridge_secs:g}s or when either side hangs up (Ctrl-C to stop)\n"))
+            ended_by = None
+            last_note = 0
+            while time.monotonic() - started < self.bridge_secs:
+                r, _, _ = select.select([self.sock, legb.sock], [], [], 0.5)
+                for s in r:
+                    t, dlg = (self, dlg_a) if s is self.sock else (legb, dlg_b)
+                    m, addr = t.recv(timeout=0.05)
+                    if t._service_in_dialog(dlg, m, addr) == "bye":
+                        ended_by = "phone" if t is self else app
+                if ended_by:
+                    break
+                el = int(time.monotonic() - started)
+                if el and el % 10 == 0 and el != last_note:
+                    last_note = el
+                    print(dim(f"    {el:3d}s  phone→{app}: {rtp_a.forwarded} pkts   {app}→phone: {rtp_b.forwarded} pkts"))
+        except KeyboardInterrupt:
+            ended_by = "you"
+            print()
+        held = time.monotonic() - started
+        if ended_by:
+            print(warn(f"  call ended by {ended_by} after {held:.0f}s"))
+        # Tear down: whichever leg is still up.
+        for t, dlg in ((self, dlg_a), (legb, dlg_b)):
+            if isinstance(dlg, dict) and not dlg.get("ended"):
+                t._hangup(dlg)
+        self.print_bridge_report(rtp_a, rtp_b, app, held, legb)
+        if self.trace_path:
+            print(bold(f"\n── SIP flow: leg B (sip:{app}@) ──") + dim("   (leg A follows)"))
+            legb.print_flow_ladder()
+        legb.close_trace()
+        return 0 if rtp_a.forwarded and rtp_b.forwarded else 1
+
+    def print_bridge_report(self, rtp_a, rtp_b, app, held, legb):
+        rec_a, rec_b = rtp_a.stop(), rtp_b.stop()
+        print(bold("\n── Bridge audio ──"))
+        print(f"  phone → {app:<6}: {rtp_a.forwarded} packets relayed" + dim(f" ({rtp_a.recv_pkts} received from phone leg)"))
+        print(f"  {app:<6} → phone: {rtp_b.forwarded} packets relayed" + dim(f" ({rtp_b.recv_pkts} received from {app} leg)"))
+        pa = {0: "PCMU", 8: "PCMA"}.get(rtp_a.pt, "?"); pb = {0: "PCMU", 8: "PCMA"}.get(rtp_b.pt, "?")
+        print(f"  codecs         : phone leg {pa}, {app} leg {pb}" + ("" if pa == pb else dim("  (transcoded)")))
+        if rec_a:
+            print(ok(f"  recorded phone : {rec_a:.1f}s → {self.record_file}"))
+        if rec_b:
+            print(ok(f"  recorded {app:<5}: {rec_b:.1f}s → {legb.record_file}"))
+        if rtp_a.forwarded and rtp_b.forwarded:
+            print(ok(f"  ✓ Two-way conversation relayed for {held:.0f}s."))
+        elif not rtp_a.recv_pkts:
+            print(bad("  ✗ no audio arrived from the phone leg"))
+        elif not rtp_b.recv_pkts:
+            print(bad(f"  ✗ no audio arrived from the {app} leg (did the app answer with media?)"))
+
     def _do_call(self, rtp):
+        dlg = self._setup_call(rtp, self.dial_target)
+        if not isinstance(dlg, dict):
+            return dlg
+        if rtp is not None and rtp.remote:
+            rtp.start_sending()
+            print(dim(f"  ACK sent. Holding {self.hold:g}s, streaming audio to "
+                      f"{rtp.remote[0]}:{rtp.remote[1]} ..."))
+        elif rtp is not None:
+            print(warn("  ACK sent. 200 OK carried no usable SDP — cannot send audio; holding "
+                       f"{self.hold:g}s listening only..."))
+        else:
+            print(dim(f"  ACK sent. Holding {self.hold:g}s (audio disabled)..."))
+        held_from = time.monotonic()
+        ended = self._hold(dlg, self.hold, rtp)
+        held = time.monotonic() - held_from
+        if ended == "bye":
+            print(warn("  far end hung up first (BYE received, answered 200)"))
+            if rtp is not None:
+                self._rtp_report(rtp, held)
+            return 0
+        media_ok = self._rtp_report(rtp, held) if rtp is not None else None
+        if self._hangup(dlg):
+            print(ok("\n  200 OK to BYE — call torn down cleanly. ✓ Outbound signalling works."))
+        else:
+            print(warn("\n  BYE sent (no/other response) — call setup itself succeeded."))
+        return 0 if media_ok in (True, None) else 1
+
+    def _hold(self, dlg, seconds, rtp=None):
+        """Sit in the call for `seconds`, answering retransmitted 200s and a far-end BYE.
+        Returns "bye" if the far end hung up, else "done"."""
+        held_from = time.monotonic()
+        while time.monotonic() - held_from < seconds:
+            m, addr = self.recv(timeout=min(0.5, seconds - (time.monotonic() - held_from)))
+            if self._service_in_dialog(dlg, m, addr) == "bye":
+                return "bye"
+        return "done"
+
+    def _service_in_dialog(self, dlg, m, addr):
+        """Handle one in-dialog message: re-ACK a retransmitted 200, answer a BYE."""
+        if not m:
+            return None
+        if self.status(m) == 200 and (self.header(m, "CSeq") or "").endswith("INVITE"):
+            self.send(self.build_ack(dlg["cseq"], dlg["to"], dlg["ack_branch"], dlg["req_uri"]))
+            return "reack"
+        if m.startswith("BYE "):
+            self._reply(m, addr, 200, "OK")
+            dlg["ended"] = True
+            return "bye"
+        return None
+
+    def _hangup(self, dlg):
+        """Send BYE (unless the far end already did) — True if it was answered 200."""
+        if dlg.get("ended"):
+            return True
+        dlg["cseq"] += 1
+        self.send(self.build_bye(dlg["cseq"], dlg["to"], self._branch()))
+        bye_resp, _ = self.recv(timeout=self.timeout)
+        dlg["ended"] = True
+        return self.status(bye_resp) == 200
+
+    def _setup_call(self, rtp, target):
+        """INVITE `target`, follow the transaction to a final answer and ACK it.
+        Returns a dialog dict on 2xx, else an int exit code."""
         cseq = 1
         branch = self._branch()
+        self.dial_target = target
         self.send(self.build_invite(cseq, branch))
         req_uri = f"sip:{self.dial_target}@{self.host}"
-        answered_to = None
         got_provisional = False
         deadline = time.monotonic() + 30  # overall call-setup window
         while time.monotonic() < deadline:
@@ -712,39 +873,7 @@ class SipTester:
                 ack_branch = self._branch()
                 self.send(self.build_ack(cseq, answered_to, ack_branch, req_uri))
                 self._learn_remote_media(rtp, msg, "200")
-                if rtp is not None and rtp.remote:
-                    rtp.start_sending()
-                    print(dim(f"  ACK sent. Holding {self.hold:g}s, streaming audio to "
-                              f"{rtp.remote[0]}:{rtp.remote[1]} ..."))
-                elif rtp is not None:
-                    print(warn("  ACK sent. 200 OK carried no usable SDP — cannot send audio; holding "
-                               f"{self.hold:g}s listening only..."))
-                else:
-                    print(dim(f"  ACK sent. Holding {self.hold:g}s (audio disabled)..."))
-                held_from = time.monotonic()
-                # Stay responsive to in-dialog requests (e.g. far-end BYE) while holding.
-                while time.monotonic() - held_from < self.hold:
-                    m, addr = self.recv(timeout=min(0.5, self.hold - (time.monotonic() - held_from)))
-                    if m and self.status(m) == 200 and (self.header(m, "CSeq") or "").endswith("INVITE"):
-                        # retransmitted 200 OK: the far end hasn't seen our ACK — resend it
-                        self.send(self.build_ack(cseq, answered_to, ack_branch, req_uri))
-                        continue
-                    if m and m.startswith("BYE "):
-                        self._reply(m, addr, 200, "OK")
-                        print(warn("  far end hung up first (BYE received, answered 200)"))
-                        if rtp is not None:
-                            self._rtp_report(rtp, time.monotonic() - held_from)
-                        return 0
-                held = time.monotonic() - held_from
-                media_ok = self._rtp_report(rtp, held) if rtp is not None else None
-                cseq += 1
-                self.send(self.build_bye(cseq, answered_to, self._branch()))
-                bye_resp, _ = self.recv(timeout=self.timeout)
-                if self.status(bye_resp) == 200:
-                    print(ok("\n  200 OK to BYE — call torn down cleanly. ✓ Outbound signalling works."))
-                else:
-                    print(warn("\n  BYE sent (no/other response) — call setup itself succeeded."))
-                return 0 if media_ok in (True, None) else 1
+                return {"cseq": cseq, "to": answered_to, "ack_branch": ack_branch, "req_uri": req_uri, "ended": False}
             if st and 300 <= st < 400:
                 print(warn(f"  {st} {reason} — redirect")); return 1
             if st and st >= 400:
@@ -862,7 +991,8 @@ class SipTester:
 
 def main():
     ap = argparse.ArgumentParser(description="Pure-Python SIP trunk tester (IP-whitelist)")
-    ap.add_argument("command", choices=["diagnose", "options", "call", "listen"])
+    ap.add_argument("command", choices=["diagnose", "options", "call", "bridge", "listen"])
+    ap.add_argument("--app", help="bridge: platform app to connect the phone to (default BRIDGE_APP / ai)")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.env"))
     ap.add_argument("--verbose", "-v", action="store_true", help="print raw SIP messages to the console")
     ap.add_argument("--trace", nargs="?", const="__DEFAULT__", metavar="FILE",
@@ -885,6 +1015,8 @@ def main():
             rc = t.do_diagnose()
         elif args.command == "call":
             rc = t.do_call()
+        elif args.command == "bridge":
+            rc = t.do_bridge(args.app)
         elif args.command == "listen":
             rc = t.do_listen()
     except KeyboardInterrupt:

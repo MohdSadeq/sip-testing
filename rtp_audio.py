@@ -161,6 +161,8 @@ class RtpSession:
         self.seq_gaps = 0
         self._last_seq = None
         self._rec_pcm = []
+        self.forward_to = None        # another RtpSession: relay our incoming audio out of it
+        self.forwarded = 0
         self._stop = threading.Event()
         self._send = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -206,15 +208,7 @@ class RtpSession:
                         offset = 0
                         chunk = payload[:SAMPLES_PER_PKT]
                     offset += SAMPLES_PER_PKT
-                    marker = 0x80 if self.sent == 0 else 0
-                    hdr = struct.pack("!BBHII", 0x80, marker | self.pt, self.seq, self.ts, self.ssrc)
-                    try:
-                        self.sock.sendto(hdr + chunk, self.remote)
-                    except OSError:
-                        pass
-                    self.sent += 1
-                    self.seq = (self.seq + 1) & 0xFFFF
-                    self.ts = (self.ts + SAMPLES_PER_PKT) & 0xFFFFFFFF
+                    self.emit(chunk)
                     next_tx += PTIME_MS / 1000.0
                 wait = max(0.0, min(next_tx - time.monotonic(), 0.02))
             else:
@@ -252,5 +246,23 @@ class RtpSession:
         if self._last_seq is not None and seq != ((self._last_seq + 1) & 0xFFFF):
             self.seq_gaps += 1
         self._last_seq = seq
-        if pt in (0, 8) and self.record_path:
+        if pt not in (0, 8):
+            return
+        if self.record_path:
             self._rec_pcm.extend(decode(payload, pt))
+        peer = self.forward_to
+        if peer is not None and peer.remote:
+            peer.emit(payload if pt == peer.pt else encode(decode(payload, pt), peer.pt))
+            self.forwarded += 1
+
+    def emit(self, payload):
+        """Send one 20 ms G.711 frame to our remote as our own stream (relay use)."""
+        marker = 0x80 if self.sent == 0 else 0
+        hdr = struct.pack("!BBHII", 0x80, marker | self.pt, self.seq, self.ts, self.ssrc)
+        try:
+            self.sock.sendto(hdr + payload, self.remote)
+        except OSError:
+            return
+        self.sent += 1
+        self.seq = (self.seq + 1) & 0xFFFF
+        self.ts = (self.ts + len(payload)) & 0xFFFFFFFF

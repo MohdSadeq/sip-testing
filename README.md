@@ -21,7 +21,7 @@ the provider has whitelisted**, fill in `config.env`, and run.
    `DIAL_TARGET` and `CALLER_ID`.
 3. Run a test (below).
 
-## The four tests
+## The five tests
 
 ```bash
 # 1. Diagnose: DNS + the exact source IP the trunk sees + a reachability probe.
@@ -41,7 +41,12 @@ python3 sip_test.py options
 #    to a WAV — so it proves the two-way voice path, not just signalling.
 python3 sip_test.py call
 
-# 4. Inbound DID: wait for the trunk to deliver a call, auto-answer 200 then BYE.
+# 4. Outbound conversation with a platform app: dial DIAL_TARGET (phone) and
+#    sip:ai@SIP_HOST (the voice-AI agent) through the PBX, then relay audio
+#    between them. The person on the phone talks to the AI. --app ivr|vm|ai.
+python3 sip_test.py bridge --trace
+
+# 5. Inbound DID: wait for the trunk to deliver a call, auto-answer 200 then BYE.
 #    The provider must be pointing your DID at THIS server:LOCAL_PORT.
 python3 sip_test.py listen
 ```
@@ -102,6 +107,31 @@ RTP packet that comes back is counted and decoded into a WAV:
   not open. `AUDIO=off` returns to a signalling-only call.
 - The tester uses `RTP/AVP` (plain, no SRTP). `rtp_audio.py` is stdlib-only, so
   it works on Python 3.13+ where `audioop` was removed.
+
+### Outbound AI conversation (`bridge`)
+
+The platform's apps (`ai`, `ivr`, `vm`) only run on calls that *arrive* at the app server.
+`bridge` lets you reach them from an *outbound* call — useful while inbound DIDs are not yet
+routed, or to demo the voice agent on any phone. It is a tiny B2BUA: leg A dials
+`DIAL_TARGET` via the PBX (`SIP_HOST`), and once the phone answers, leg B dials
+`sip:<BRIDGE_APP>@SIP_HOST` (Kamailio hands it to the app server, which answers at once).
+RTP is relayed between the legs, transcoding PCMA↔PCMU if they negotiated differently.
+
+```
+[A] calling +6012… → 100 / 183 / 180 / 200 OK — CALL ANSWERED
+[B] calling sip:ai@172.27.100.60 → 200 OK — CALL ANSWERED
+  ✓ bridged — talk now. The ai app hears the phone and vice versa.
+── Bridge audio ──
+  phone → ai    : 2980 packets relayed
+  ai     → phone: 2975 packets relayed
+  codecs         : phone leg PCMA, ai leg PCMU  (transcoded)
+  recorded phone : 59.6s → ./recv-…-phone.wav      (what the person said)
+  recorded ai    : 59.5s → ./recv-…-ai.wav         (what the agent said)
+```
+
+Leg B uses `LOCAL_PORT+2` / `MEDIA_PORT+2`. `BRIDGE_SECONDS` (default 120) caps the call;
+it also ends when either side hangs up, or on Ctrl-C. `--app ivr` connects the phone to the
+IVR instead. Both dialogs are Record-Routed through Kamailio like any production call.
 
 `run.sh` is a convenience wrapper: `./run.sh diagnose`, `./run.sh options`, etc.
 
