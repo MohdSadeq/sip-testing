@@ -464,6 +464,22 @@ class SipTester:
     def build_bye(self, cseq, to_hdr, branch):
         return self._in_dialog("BYE", cseq, to_hdr, branch, f"sip:{self.dial_target}@{self.host}")
 
+    def build_cancel(self, cseq, branch):
+        """CANCEL a pending INVITE: same R-URI, branch and CSeq number (RFC 3261 §9.1)."""
+        req_uri = f"sip:{self.dial_target}@{self.host}"
+        lines = [
+            f"CANCEL {req_uri} SIP/2.0",
+            f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch};rport",
+            "Max-Forwards: 70",
+            f"From: <sip:{self.caller_id}@{self.host}>;tag={self.from_tag}",
+            f"To: <{req_uri}>",
+            f"Call-ID: {self.call_id}",
+            f"CSeq: {cseq} CANCEL",
+            "Content-Length: 0",
+            "", "",
+        ]
+        return "\r\n".join(lines)
+
     # ── high-level flows ────────────────────────────────────────
     def print_target(self):
         print(bold("Trunk target"))
@@ -700,9 +716,15 @@ class SipTester:
                 print(bad("  leg A (phone) did not answer — nothing to bridge"))
                 return dlg_a
             print(bold(f"\n[B] calling sip:{app}@{self.host} ..."))
-            dlg_b = legb._setup_call(rtp_b, app)
+            dlg_b = legb._setup_call(rtp_b, app, others=[(self, dlg_a)], setup_secs=15)
             if not isinstance(dlg_b, dict):
-                print(bad(f"  leg B (sip:{app}@) failed — hanging up the phone"))
+                if dlg_b == 3:
+                    print(warn("  phone hung up before the app answered"))
+                else:
+                    print(bad(f"  leg B (sip:{app}@) failed — hanging up the phone"))
+                    print(dim("     Kamailio could not get an answer from the app server: check"))
+                    print(dim("     `systemctl status appserver` and that APPSERVER_PROXY_ADDR points"))
+                    print(dim("     at the address Kamailio listens on (journalctl -u appserver -n 5)."))
                 self._hangup(dlg_a); dlg_a = None
                 return dlg_b
             started = time.monotonic()
@@ -819,17 +841,32 @@ class SipTester:
         dlg["ended"] = True
         return self.status(bye_resp) == 200
 
-    def _setup_call(self, rtp, target):
+    def _setup_call(self, rtp, target, others=(), setup_secs=30):
         """INVITE `target`, follow the transaction to a final answer and ACK it.
-        Returns a dialog dict on 2xx, else an int exit code."""
+        Returns a dialog dict on 2xx, else an int exit code (3 = aborted because a
+        dialog in `others` — e.g. the phone leg of a bridge — hung up meanwhile;
+        `others` is a list of (tester, dialog) kept serviced while we wait)."""
         cseq = 1
         branch = self._branch()
         self.dial_target = target
         self.send(self.build_invite(cseq, branch))
         req_uri = f"sip:{self.dial_target}@{self.host}"
         got_provisional = False
-        deadline = time.monotonic() + 30  # overall call-setup window
+        deadline = time.monotonic() + setup_secs  # overall call-setup window
         while time.monotonic() < deadline:
+            if others:
+                r, _, _ = select.select([self.sock] + [t.sock for t, _ in others], [], [],
+                                        max(0.0, min(0.5, deadline - time.monotonic())))
+                for t, dlg in others:
+                    if t.sock in r:
+                        m, addr = t.recv(timeout=0.05)
+                        if t._service_in_dialog(dlg, m, addr) == "bye":
+                            print(warn("  the other leg hung up — cancelling this INVITE"))
+                            self.send(self.build_cancel(cseq, branch))
+                            self.recv(timeout=self.timeout)   # 200 to CANCEL / 487
+                            return 3
+                if self.sock not in r:
+                    continue
             msg, _ = self.recv(timeout=deadline - time.monotonic())
             if msg is None:
                 if not got_provisional:
