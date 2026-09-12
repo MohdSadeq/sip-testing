@@ -136,7 +136,7 @@ def parse_sdp_media(sdp):
 class RtpSession:
     """Bind the advertised media port, receive from the start, send once armed."""
 
-    def __init__(self, bind_ip, bind_port, source_pcm, record_path=None):
+    def __init__(self, bind_ip, bind_port, source_pcm, record_path=None, fill_silence=False):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -163,6 +163,13 @@ class RtpSession:
         self._rec_pcm = []
         self.forward_to = None        # another RtpSession: relay our incoming audio out of it
         self.forwarded = 0
+        # Relay mode: keep a steady stream toward the remote even when nothing is being
+        # forwarded. Relays (rtpengine) start unlatched and only learn where to send from the
+        # first packet they get from us, and carrier SBCs drop calls on RTP inactivity.
+        self.fill_silence = fill_silence
+        self.filled = 0
+        self._last_emit = 0.0
+        self._emit_lock = threading.Lock()
         self._stop = threading.Event()
         self._send = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -211,6 +218,11 @@ class RtpSession:
                     self.emit(chunk)
                     next_tx += PTIME_MS / 1000.0
                 wait = max(0.0, min(next_tx - time.monotonic(), 0.02))
+            elif self.fill_silence and self.remote:
+                if now - self._last_emit >= PTIME_MS / 1000.0:
+                    self.emit(bytes([0xFF if self.pt == 0 else 0xD5]) * SAMPLES_PER_PKT)
+                    self.filled += 1
+                wait = 0.005
             else:
                 wait = 0.02
             r, _, _ = select.select([self.sock], [], [], wait)
@@ -257,12 +269,14 @@ class RtpSession:
 
     def emit(self, payload):
         """Send one 20 ms G.711 frame to our remote as our own stream (relay use)."""
-        marker = 0x80 if self.sent == 0 else 0
-        hdr = struct.pack("!BBHII", 0x80, marker | self.pt, self.seq, self.ts, self.ssrc)
-        try:
-            self.sock.sendto(hdr + payload, self.remote)
-        except OSError:
-            return
-        self.sent += 1
-        self.seq = (self.seq + 1) & 0xFFFF
-        self.ts = (self.ts + len(payload)) & 0xFFFFFFFF
+        with self._emit_lock:
+            marker = 0x80 if self.sent == 0 else 0
+            hdr = struct.pack("!BBHII", 0x80, marker | self.pt, self.seq, self.ts, self.ssrc)
+            try:
+                self.sock.sendto(hdr + payload, self.remote)
+            except OSError:
+                return
+            self.sent += 1
+            self.seq = (self.seq + 1) & 0xFFFF
+            self.ts = (self.ts + len(payload)) & 0xFFFFFFFF
+            self._last_emit = time.monotonic()

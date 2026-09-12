@@ -703,8 +703,8 @@ class SipTester:
         if self.record_file:
             self.record_file = self.record_file.replace(".wav", "-phone.wav")
 
-        rtp_a = rtp_audio.RtpSession(self.media_ip, self.media_port, [], self.record_file)
-        rtp_b = rtp_audio.RtpSession(legb.media_ip, legb.media_port, [], legb.record_file)
+        rtp_a = rtp_audio.RtpSession(self.media_ip, self.media_port, [], self.record_file, fill_silence=True)
+        rtp_b = rtp_audio.RtpSession(legb.media_ip, legb.media_port, [], legb.record_file, fill_silence=True)
         rtp_a.forward_to, rtp_b.forward_to = rtp_b, rtp_a
         print(dim(f"  RTP: leg A on {rtp_a.bound[0]}:{rtp_a.bound[1]}, leg B on {rtp_b.bound[0]}:{rtp_b.bound[1]} (relay mode)"))
         dlg_a = dlg_b = None
@@ -769,6 +769,7 @@ class SipTester:
         print(f"  {app:<6} → phone: {rtp_b.forwarded} packets relayed" + dim(f" ({rtp_b.recv_pkts} received from {app} leg)"))
         pa = {0: "PCMU", 8: "PCMA"}.get(rtp_a.pt, "?"); pb = {0: "PCMU", 8: "PCMA"}.get(rtp_b.pt, "?")
         print(f"  codecs         : phone leg {pa}, {app} leg {pb}" + ("" if pa == pb else dim("  (transcoded)")))
+        print(dim(f"  silence fill   : {rtp_a.filled} frames to phone, {rtp_b.filled} frames to {app} (sent while the other side was quiet)"))
         if rec_a:
             print(ok(f"  recorded phone : {rec_a:.1f}s → {self.record_file}"))
         if rec_b:
